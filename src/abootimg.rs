@@ -118,14 +118,14 @@ fn gzip_deflate_slice(data: &[u8]) -> Option<&[u8]> {
     Some(&data[offset..data.len() - 8])
 }
 
-fn gzip_decompress(payload: &[u8], output: &mut [u8]) -> Result<(), &'static str> {
+fn gzip_decompress(payload: &[u8], output: &mut [u8]) -> Result<usize, &'static str> {
     let deflate_data = gzip_deflate_slice(payload).unwrap();
     let mut decomp = DecompressorOxide::new();
 
-    let (status, _, _) = decompress(&mut decomp, deflate_data, output, 0, 0);
+    let (status, _, out_consumed) = decompress(&mut decomp, deflate_data, output, 0, 0);
 
     match status {
-        TINFLStatus::Done => Ok(()),
+        TINFLStatus::Done => Ok(out_consumed),
         _ => Err(Error::new(
             Status::LOAD_ERROR,
             "failed to decompress kernel",
@@ -216,10 +216,11 @@ pub(crate) fn handle_bootimg_v2(
             FastbootBuffer::alloc(MemoryType::RUNTIME_SERVICES_CODE, 128 * 1024 * 1024)
                 .with_context("failed to allocate memory for kernel")?;
 
-        gzip_decompress(
+        let decompressed_size = gzip_decompress(
             &payload[kernel_offset..kernel_offset + kernel_size],
             kernel.as_mut_slice(),
         )?;
+        kernel.len = decompressed_size;
 
         kernel
     } else {
