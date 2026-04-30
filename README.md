@@ -39,11 +39,15 @@ or:
 systemd-repart fastboot-ufs-disk.img --empty=create --size=512M --sector-size=4096 --definitions=repart.d --root=$PWD
 ```
 
-This file can be written straight to a NVMe (or UFS) device, which upon booting
-automatically enters fastboot mode.
+These files can be written straight to a NVMe or UFS device, starting at sector
+0, using e.g. **qdl**, e.g.:
 
-*rawprogram-nvme.xml* and *rawprogram-ufs.xml* are included for convenient
-application with common flash tools.
+
+```
+qdl prog_firehose_ddr.elf --storage ufs write 0 fastboot-ufs-disk.img
+```
+
+Upon booting the device will automatically enter fastboot mode.
 
 ## *fastboot boot* an UKI (or other EFI application)
 
