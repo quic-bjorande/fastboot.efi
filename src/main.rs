@@ -74,27 +74,31 @@ fn fastboot_open(serial_number: &CStr16) -> Result<ScopedProtocol<EfiUsbDevice>>
     Ok(usb_device)
 }
 
-fn fastboot_respond(usb_device: &ScopedProtocol<EfiUsbDevice>, response: &str) -> Result {
-    let buf = usb_device
-        .allocate_transfer_buffer(64)
-        .expect("failed to allocate command buffer");
-
+fn fastboot_respond(
+    usb_device: &ScopedProtocol<EfiUsbDevice>,
+    response_buffer: *mut u8,
+    response: &str,
+) -> Result {
     let mut payload = response.as_bytes().to_vec();
     let payload_len = payload.len().min(64);
     payload.push(0);
 
     unsafe {
-        ptr::copy_nonoverlapping(payload.as_ptr(), buf, payload_len);
+        ptr::copy_nonoverlapping(payload.as_ptr(), response_buffer, payload_len);
     }
 
     usb_device
-        .send(usb_device::ENDPOINT_IN, payload_len, buf)
+        .send(usb_device::ENDPOINT_IN, payload_len, response_buffer)
         .expect("failed to send response");
 
     Ok(())
 }
 
-fn handle_download(usb_device: &ScopedProtocol<EfiUsbDevice>, size: usize) -> Result<&[u8]> {
+fn handle_download(
+    usb_device: &ScopedProtocol<EfiUsbDevice>,
+    response_buffer: *mut u8,
+    size: usize,
+) -> Result<&[u8]> {
     let mut download_remains = size;
 
     let target = boot::allocate_pool(MemoryType::BOOT_SERVICES_DATA, size).unwrap();
@@ -107,7 +111,7 @@ fn handle_download(usb_device: &ScopedProtocol<EfiUsbDevice>, size: usize) -> Re
         .allocate_transfer_buffer(16 * 1024 * 1024)
         .expect("failed to allocate command buffer");
 
-    fastboot_respond(usb_device, &format!("DATA{size:08x}"))?;
+    fastboot_respond(usb_device, response_buffer, &format!("DATA{size:08x}"))?;
 
     usb_device
         .send(
@@ -146,7 +150,7 @@ fn handle_download(usb_device: &ScopedProtocol<EfiUsbDevice>, size: usize) -> Re
     usb_device.free_transfer_buffer(receive_buffer)?;
 
     if offset == target_slice.len() {
-        fastboot_respond(usb_device, "OKAY")?;
+        fastboot_respond(usb_device, response_buffer, "OKAY")?;
     }
 
     Ok(target_slice)
@@ -245,7 +249,11 @@ fn create_empty_rt_properties_table() -> Result<FastbootBuffer> {
     Ok(buf)
 }
 
-fn handle_boot(usb_device: &ScopedProtocol<EfiUsbDevice>, payload: &[u8]) -> Result {
+fn handle_boot(
+    usb_device: &ScopedProtocol<EfiUsbDevice>,
+    response_buffer: *mut u8,
+    payload: &[u8],
+) -> Result {
     let (handle, _initrd) = if is_peimage(payload) {
         (handle_peimage(payload)?, None)
     } else if let Some(machine) = pe_machine(payload) {
@@ -256,6 +264,7 @@ fn handle_boot(usb_device: &ScopedProtocol<EfiUsbDevice>, payload: &[u8]) -> Res
         );
         fastboot_respond(
             usb_device,
+            response_buffer,
             &format!(
                 "FAILunsupported EFI arch {:04x}, need {:04x}",
                 machine,
@@ -266,32 +275,48 @@ fn handle_boot(usb_device: &ScopedProtocol<EfiUsbDevice>, payload: &[u8]) -> Res
     } else if is_bootimg_v0(payload) {
         let result = handle_bootimg_v0(payload);
         if let Err(err) = result {
-            fastboot_respond(usb_device, &format!("FAILfailed: {}", err.data()))?;
+            fastboot_respond(
+                usb_device,
+                response_buffer,
+                &format!("FAILfailed: {}", err.data()),
+            )?;
             return Ok(());
         }
         (result.unwrap(), None)
     } else if is_bootimg_v2(payload) {
         let result = handle_bootimg_v2(payload);
         if let Err(err) = result {
-            fastboot_respond(usb_device, &format!("FAILfailed: {}", err.data()))?;
+            fastboot_respond(
+                usb_device,
+                response_buffer,
+                &format!("FAILfailed: {}", err.data()),
+            )?;
             return Ok(());
         }
         result.unwrap()
     } else {
         info!("rejecting payload with unsupported format");
-        fastboot_respond(usb_device, "FAILunsupported boot image format")?;
+        fastboot_respond(
+            usb_device,
+            response_buffer,
+            "FAILunsupported boot image format",
+        )?;
         return Ok(());
     };
 
     create_empty_rt_properties_table()?.install_configuration_table(&EFI_RT_PROPERTIES_TABLE)?;
 
-    fastboot_respond(usb_device, "OKAY")?;
+    fastboot_respond(usb_device, response_buffer, "OKAY")?;
     boot::start_image(handle)?;
 
     Ok(())
 }
 
-fn handle_getvar(usb_device: &ScopedProtocol<EfiUsbDevice>, variable: &str) -> Result {
+fn handle_getvar(
+    usb_device: &ScopedProtocol<EfiUsbDevice>,
+    response_buffer: *mut u8,
+    variable: &str,
+) -> Result {
     let response = match variable {
         "version" => Some("0.4"),
         "version-bootloader" => Some(env!("BUILD_VERSION")),
@@ -303,7 +328,7 @@ fn handle_getvar(usb_device: &ScopedProtocol<EfiUsbDevice>, variable: &str) -> R
         None => format!("FAILunknown variable: {variable}"),
     };
 
-    fastboot_respond(usb_device, &response).expect("Failed to send response");
+    fastboot_respond(usb_device, response_buffer, &response).expect("Failed to send response");
 
     Ok(())
 }
@@ -344,6 +369,9 @@ fn main() -> Status {
     let command_buffer = usb_device
         .allocate_transfer_buffer(1024 * 1024)
         .expect("failed to allocate command buffer");
+    let response_buffer = usb_device
+        .allocate_transfer_buffer(64)
+        .expect("failed to allocate response buffer");
 
     let mut loaded_data: Option<&[u8]> = None;
 
@@ -364,16 +392,22 @@ fn main() -> Status {
                     let parts = request.split(':').nth(1).unwrap();
                     let size = usize::from_str_radix(parts, 16).unwrap();
 
-                    loaded_data = Some(handle_download(&usb_device, size).unwrap());
+                    loaded_data =
+                        Some(handle_download(&usb_device, response_buffer, size).unwrap());
                 } else if request == "boot" {
                     if let Some(payload) = loaded_data {
-                        handle_boot(&usb_device, payload).expect("Failed to handle boot command");
+                        handle_boot(&usb_device, response_buffer, payload)
+                            .expect("Failed to handle boot command");
                     } else {
-                        fastboot_respond(&usb_device, "FAILdownload something first")
-                            .expect("Failed to send response");
+                        fastboot_respond(
+                            &usb_device,
+                            response_buffer,
+                            "FAILdownload something first",
+                        )
+                        .expect("Failed to send response");
                     };
                 } else if request == "reboot" {
-                    let _ = fastboot_respond(&usb_device, "OKAY");
+                    let _ = fastboot_respond(&usb_device, response_buffer, "OKAY");
 
                     let reset_data = cstr16!("RESET_PARAM");
                     runtime::reset(
@@ -382,19 +416,20 @@ fn main() -> Status {
                         Some(reset_data.as_bytes()),
                     );
                 } else if request == "continue" {
-                    let _ = fastboot_respond(&usb_device, "OKAY");
+                    let _ = fastboot_respond(&usb_device, response_buffer, "OKAY");
 
                     break 'message_loop;
                 } else if request.starts_with("getvar") {
                     let Some(variable) = request.split(':').nth(1) else {
-                        fastboot_respond(&usb_device, "FAILinvalid getvar")
+                        fastboot_respond(&usb_device, response_buffer, "FAILinvalid getvar")
                             .expect("Failed to send response");
                         continue;
                     };
 
-                    handle_getvar(&usb_device, variable).expect("Failed to handle getvar command");
+                    handle_getvar(&usb_device, response_buffer, variable)
+                        .expect("Failed to handle getvar command");
                 } else {
-                    fastboot_respond(&usb_device, "FAILunknown command")
+                    fastboot_respond(&usb_device, response_buffer, "FAILunknown command")
                         .expect("Failed to send response");
                 }
 
@@ -410,6 +445,9 @@ fn main() -> Status {
     usb_device
         .free_transfer_buffer(command_buffer)
         .expect("Failed to free transfer buffer");
+    usb_device
+        .free_transfer_buffer(response_buffer)
+        .expect("Failed to free response buffer");
 
     Status::SUCCESS
 }
