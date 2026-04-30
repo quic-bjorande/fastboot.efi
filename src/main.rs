@@ -24,7 +24,7 @@ mod initrd;
 mod memcardinfo;
 
 mod peimage;
-use peimage::{handle_peimage, is_peimage};
+use peimage::{expected_pe_machine, handle_peimage, is_peimage, pe_machine};
 
 mod proto;
 
@@ -248,6 +248,21 @@ fn create_empty_rt_properties_table() -> Result<FastbootBuffer> {
 fn handle_boot(usb_device: &ScopedProtocol<EfiUsbDevice>, payload: &[u8]) -> Result {
     let (handle, _initrd) = if is_peimage(payload) {
         (handle_peimage(payload)?, None)
+    } else if let Some(machine) = pe_machine(payload) {
+        info!(
+            "rejecting EFI payload with unsupported machine {:04x}, expected {:04x}",
+            machine,
+            expected_pe_machine()
+        );
+        fastboot_respond(
+            usb_device,
+            &format!(
+                "FAILunsupported EFI arch {:04x}, need {:04x}",
+                machine,
+                expected_pe_machine()
+            ),
+        )?;
+        return Ok(());
     } else if is_bootimg_v0(payload) {
         let result = handle_bootimg_v0(payload);
         if let Err(err) = result {
@@ -263,8 +278,9 @@ fn handle_boot(usb_device: &ScopedProtocol<EfiUsbDevice>, payload: &[u8]) -> Res
         }
         result.unwrap()
     } else {
-        fastboot_respond(usb_device, "FAIL")?;
-        return Err(uefi::Error::new(Status::INVALID_PARAMETER, ()));
+        info!("rejecting payload with unsupported format");
+        fastboot_respond(usb_device, "FAILunsupported boot image format")?;
+        return Ok(());
     };
 
     create_empty_rt_properties_table()?.install_configuration_table(&EFI_RT_PROPERTIES_TABLE)?;
